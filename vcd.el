@@ -109,8 +109,11 @@
          (size (second inner))
          (code (third inner))
          (signal-name (fourth inner)))
-    (list signal-name code ty size)))
+    (list 'declare-signal signal-name code ty size)))
 
+
+(defun parsec-whitespace ()
+  (parsec-one-of ?\n ?\t ?\ ))
 
 (parsec-with-input "$var logic 1 ) beeg $end"
   (parse-var-decl))
@@ -118,8 +121,9 @@
 (defun parse-vcd ()
   (parsec-sepby (parsec-or (parse-var-decl)
                            (parse-scope)
-                           (parse-upscope))
-                (parsec-re ".*")))
+                           (parse-upscope)
+                           (let ((blah (parsec-many (parsec-any-ch)))) nil))
+                (parsec-many (parsec-whitespace))))
 
 (parsec-with-input "$scope module top $end
         $scope module m1 $end
@@ -133,8 +137,23 @@ $var integer 32 {2 index $end
 $upscope $end
 $upscope $end" (parse-vcd))
 
-(parsec-with-input (string-truncate-left sample-vcd 2000)
+(parsec-with-input (substring sample-vcd 101 2000)
   (parse-vcd))
+
+(defun mk-signal-name-table (decls)
+  (let ((shortname-map (make-hash-table))
+        (stk '()))
+    (progn (dolist (decl decls)
+              (pcase decl
+                (`(push ,hier-name) (setf stk (cons hier-name stk)))
+                (`(pop) (setf stk (cdr stk)))
+                (`(declare-signal ,signal-name ,code ,ty ,size)
+                 (let ((full-name (string-join (reverse (cons signal-name stk)) ".")))
+                   (puthash signal-name (list code ty size) shortname-map)))))
+           shortname-map)))
+
+(mk-signal-name-table (parsec-with-input (substring sample-vcd 101 2000)
+                         (parse-vcd)))
 
 (defun vcd-parse-all-signal-traces (vcd-text)
   "TODO Dumps trace data for every traced signal in one pass.
@@ -150,3 +169,4 @@ $upscope $end" (parse-vcd))
 
 (provide 'vcd)
 ;;; vcd.el ends here
+
