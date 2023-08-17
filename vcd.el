@@ -43,10 +43,10 @@
  :version 1.4
  :timescale '(1.5 "ns"))
 
-(defun vcd-parse-header (vcd-text)
+(defun parse-vcd-header ()
   "Parse VCD-HEADER-TEXT into a vcd-header struct."
   (cl-flet ((extract-field (field)
-                           (parsec-with-input vcd-text
+                           (progn
                              (parsec-many-till
                               (parsec-any-ch)
                               (parsec-re (format "\\$%s" field)))
@@ -60,7 +60,7 @@
      :comment nil ;; (extract-field "comment")
      )))
 
-(vcd-parse-header sample-vcd)
+(parsec-with-input sample-vcd (parse-vcd-header))
 
 ;; internal signal trace data structure will be a hashmap H of hashmaps
 ;;
@@ -75,9 +75,6 @@
 ;;                      plot "|"+ cur_val[signal_name]
 ;;              else:
 ;;                      plot " " + cur_val[signal_name]
-
-(defun vcd-parse-signal-trace (signal-identifier vcd-text)
-  nil)
 
 (defun parse-scope ()
   "Parses a scope declaration"
@@ -118,12 +115,16 @@
 (parsec-with-input "$var logic 1 ) beeg $end"
   (parse-var-decl))
 
-(defun parse-vcd ()
-  (parsec-sepby (parsec-or (parse-var-decl)
-                           (parse-scope)
-                           (parse-upscope)
-                           (let ((blah (parsec-many (parsec-any-ch)))) nil))
-                (parsec-many (parsec-whitespace))))
+(defun parse-var-bureaucracy ()
+  (parsec-or
+   (parse-var-decl)
+   (parse-scope)
+   (parse-upscope)))
+
+(defun parse-vcd-name-decls ()
+  (parsec-many1 (parsec-return
+                   (parse-var-bureaucracy)
+                  (parsec-many (parsec-whitespace)))))
 
 (parsec-with-input "$scope module top $end
         $scope module m1 $end
@@ -135,30 +136,99 @@ $scope task t1 $end
 $var reg 32 (k accumulator[31:0] $end
 $var integer 32 {2 index $end
 $upscope $end
-$upscope $end" (parse-vcd))
+$upscope $end" (parse-vcd-name-decls))
 
-(parsec-with-input (substring sample-vcd 101 2000)
-  (parse-vcd))
+(parsec-with-input (substring sample-vcd 101 430)
+  (parse-vcd-name-decls))
 
 (defun mk-signal-name-table (decls)
-  (let ((shortname-map (make-hash-table))
+  (let ((name-map (make-hash-table))
         (stk '()))
     (progn (dolist (decl decls)
               (pcase decl
                 (`(push ,hier-name) (setf stk (cons hier-name stk)))
                 (`(pop) (setf stk (cdr stk)))
                 (`(declare-signal ,signal-name ,code ,ty ,size)
-                 (let ((full-name (string-join (reverse (cons signal-name stk)) ".")))
-                   (puthash signal-name (list code ty size) shortname-map)))))
-           shortname-map)))
+                 (let ((full-name (string-join (reverse (cons signal-name stk)) "."))
+                       (time-map (make-hash-table)))
+                   (puthash code (list full-name ty size time-map) name-map)))))
+           name-map)))
 
-(mk-signal-name-table (parsec-with-input (substring sample-vcd 101 2000)
-                         (parse-vcd)))
+(mk-signal-name-table (parsec-with-input "$scope module top $end
+        $scope module m1 $end
+        $var trireg 1 *@ net1 $end
+                $var trireg 1 *# net2 $end
+        $var trireg 1 *$ net3 $end
+        $upscope $end
+$scope task t1 $end
+$var reg 32 (k accumulator[31:0] $end
+$var integer 32 {2 index $end
+$upscope $end
+$upscope $end" (parse-vcd-name-decls)))
+
+(defun parse-vcd-namemap ()
+  (mk-signal-name-table (parse-vcd-name-decls)))
+
+(defun parse-time ()
+  (list 'time (parsec-and (parsec-ch ?#)
+                          (parsec-return (string-to-number (parsec-many1-as-string (parsec-digit)))
+                            (parsec-eol-or-eof)))))
+
+(defun parse-identifier ()
+  (string-trim (parsec-many1-as-string (parsec-nonwhitespace)))
+  )
+
+(defun parsec-nonwhitespace ()
+  (parsec-none-of ?\n ?\t ?\ ))
+
+(defun parse-value ()
+  (string-trim (parsec-many1-as-string (parsec-nonwhitespace)))       ; FIXME
+  )
+
+(defun parse-value-change ()
+  (let ((value (parse-value))
+        (_ (parsec-many1 (parsec-whitespace)))
+        (id (parse-identifier)))
+    (list 'chg id value)))
+
+(parsec-with-input "0b1000 )k" (parse-value-change))
+
+(defun parse-value-changes ()
+    (parsec-many1 (parsec-return
+                      (parse-value-change)
+                    (parsec-many (parsec-whitespace)))))
+
+(defun parse-one-time-signal-dump (name-map)
+  (let ((cur-time (cadr (parsec-and (parsec-many (parsec-whitespace))
+                                    (parse-time)))))
+    (mapcar #'(lambda (chg) (pcase chg
+                              (`(chg ,id ,value) (let ((time-map (pcase (gethash id name-map)
+                                                                   (`(,_ ,_ ,_ ,t) t))))
+                                                   (puthash cur-time value time-map)))))
+            (parse-value-changes))))
+
+(defun parse-signal-dumps (name-map)
+  (progn (parsec-many-till (parsec-any-ch)
+                           (parsec-lookahead (parsec-str "#")))
+         (parsec-many (parsec-whitespace))
+         (parsec-many (parsec-return
+                             (parse-one-time-signal-dump name-map)
+                           (parsec-many (parsec-whitespace))))))
+
+(defun parse-vcd ()
+  (let* ((header (parse-vcd-header))
+         (_ (parsec-many (parsec-whitespace)))
+         (m (parse-vcd-namemap))
+         (_ (parsec-many (parsec-whitespace)))
+         (_ (parse-signal-dumps m)))
+    m))
+
+(parsec-with-input sample-vcd (parse-vcd))
 
 (defun vcd-parse-all-signal-traces (vcd-text)
   "TODO Dumps trace data for every traced signal in one pass.
    Costly for space when the trace is very large."
-  (let (shortname-map (make-hash-table))
+  (let (name-map (make-hash-table))
     (parsec-with-input vcd-text
       (parsec-many-till
        (parsec-any-ch)
